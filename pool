@@ -1,0 +1,224 @@
+#include <vector>
+#include <thread>
+#include <future>
+#include <algorithm>
+#include <random>
+#include <chrono>
+#include <iostream>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
+#include <memory>
+
+// Пул потоков с work stealing
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t num_threads);
+    ~ThreadPool();
+
+    // Запуск задачи
+    template<typename Func>
+    auto enqueue(Func&& f) -> std::future<decltype(f())>;
+
+private:
+    // Внутренние данные
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+
+    std::mutex queue_mutex_;
+    std::condition_variable condition_;
+    bool stop_;
+
+    // Для work stealing
+    std::vector<std::deque<std::function<void()>>> queues_;
+    std::mutex queues_mutex_;
+
+    void worker(size_t index);
+};
+
+ThreadPool::ThreadPool(size_t num_threads) : stop_(false), queues_(num_threads) {
+    for (size_t i = 0; i < num_threads; ++i) {
+        workers_.emplace_back(&ThreadPool::worker, this, i);
+    }
+}
+
+ThreadPool::~ThreadPool() {
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        stop_ = true;
+        condition_.notify_all();
+    }
+    for (auto& worker : workers_) {
+        if (worker.joinable()) worker.join();
+    }
+}
+
+template<typename Func>
+auto ThreadPool::enqueue(Func&& f) -> std::future<decltype(f())> {
+    auto task = std::make_shared<std::packaged_task<decltype(f())()>>(std::forward<Func>(f));
+    auto res = task->get_future();
+
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        tasks_.emplace([task]() { (*task)(); });
+    }
+    condition_.notify_one();
+    return res;
+}
+
+void ThreadPool::worker(size_t index) {
+    while (true) {
+        std::function<void()> task;
+        {
+            // Проверка наличия задач в локальной очереди
+            std::unique_lock<std::mutex> lock(queues_mutex_);
+            if (!queues_[index].empty()) {
+                task = std::move(queues_[index].front());
+                queues_[index].pop_front();
+            } else {
+                // Забираем задачу из глобальной очереди
+                std::unique_lock<std::mutex> lock_global(queue_mutex_);
+                if (stop_ && tasks_.empty()) return;
+                if (!tasks_.empty()) {
+                    task = std::move(tasks_.front());
+                    tasks_.pop();
+                } else {
+                    // Work stealing: ищем задачу в других очередях
+                    bool found = false;
+                    for (size_t i = 0; i < queues_.size(); ++i) {
+                        if (i == index || queues_[i].empty()) continue;
+                        task = std::move(queues_[i].back());
+                        queues_[i].pop_back();
+                        found = true;
+                        break;
+                    }
+                    if (!found) {
+                        condition_.wait(lock_global);
+                        continue;
+                    }
+                }
+            }
+        }
+        if (task) task();
+    }
+}
+
+// Быстрая сортировка с параллельным выполнением
+void parallel_quick_sort(std::vector<int>& data,
+                         size_t left,
+                         size_t right,
+                         ThreadPool& pool,
+                         size_t threshold);
+
+void parallel_quick_sort(std::vector<int>& data,
+                         size_t left,
+                         size_t right,
+                         ThreadPool& pool,
+                         size_t threshold) {
+
+    if (left >= right)
+        return;
+
+    if (right - left + 1 <= threshold) {
+        // Последовательная сортировка для маленьких массивов
+        std::sort(data.begin() + left, data.begin() + right + 1);
+        return;
+    }
+
+    // Выбираем опорный элемент
+    int pivot = data[left + (right - left) / 2];
+
+    size_t i = left;
+    size_t j = right;
+
+    while (i <= j) {
+        while (data[i] < pivot) ++i;
+        while (data[j] > pivot) --j;
+
+        if (i <= j) {
+            std::swap(data[i], data[j]);
+            ++i; --j;
+        }
+    }
+
+    // Создаем shared_ptr-счетчик активных задач
+    auto counter = std::make_shared<int>(0);
+    
+    // Создаем promise и future для ожидания завершения подзадач
+    auto promise_ptr = std::make_shared<std::promise<void>>();
+    
+    // Лямбда для обработки части массива
+    auto sort_part = [&](size_t l, size_t r_) {
+
+        // Увеличиваем счетчик активных задач
+        (*counter)++;
+        
+        // Запускаем рекурсивную сортировку в отдельной задаче
+        pool.enqueue([=, &data]() {
+
+            parallel_quick_sort(data, l, r_, pool, threshold);
+
+            // После выполнения уменьшаем счетчик
+            if (--(*counter) == 0) {
+                promise_ptr->set_value();  // Все подзадачи завершены
+            }
+        });
+        
+        // В случае если это последняя задача, она установит значение promise при уменьшении счетчика до нуля
+      };
+
+      // Обработка левой части массива
+      if (left < j)
+          sort_part(left, j);
+      
+      // Обработка правой части массива
+      if (i < right)
+          sort_part(i, right);
+
+      // Ожидаем завершения всех подзадач
+      auto fut = promise_ptr->get_future();
+      fut.wait();
+}
+
+int main() {
+    const size_t N = 10'000'000;  // Размер массива для теста
+
+    std::vector<int> data(N);
+    
+    // Генерируем случайные данные
+    std::mt19937 gen(42);
+    
+// Для ускорения можно использовать равномерное распределение 
+// или уже отсортированные данные для теста
+
+// Заполняем массив случайными числами
+{
+for(auto& v : data)
+v=gen();
+
+}
+
+auto start_time = std::chrono::_V2::_steady_clock_type().now();
+
+ThreadPool pool(std::thread::hardware_concurrency());
+
+size_t threshold = 100000;  // порог для последовательной сортировки
+
+parallel_quick_sort(data, 0, data.size() -1 , pool, threshold);
+
+auto end_time = std::__chrono::_V2::_steady_clock_type().now();
+
+std::chrono::_V2::_steady_clock_type duration= end_time-start_time;
+
+std::cout << "Sorting took " << duration.count()/1e9 << " seconds\n";
+
+// Проверка правильности сортировки
+if(std::__algorithm__3::__is_sorted(data.begin(), data.end()))
+{
+std ::cout<<"Sorted correctly\n";
+}
+else{
+std ::cout<<"Sorting error\n";
+}
+return 0;
+}
